@@ -25,10 +25,17 @@
  *
  * Exit codes: 0 = all sites applied (or already applied); 1 = a required site's
  * input pattern was NOT found on an unpatched file (upstream changed — inspect).
+ *
+ * A partial-apply exit 1 ("some sites PATTERN-NOT-FOUND") is an EXPECTED
+ * unattended state to inspect, not a reason to reflexively roll back: each
+ * matched site is individually safe and already written (a .pre-hotfix.bak
+ * copy of the original sits next to the target) — only the run's exit code is
+ * failed so monitoring catches it. Writes are atomic (tmp file + rename) and
+ * always preceded by the .pre-hotfix.bak backup.
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -164,6 +171,20 @@ function sh(cmd, args, opts = {}) {
   return spawnSync(cmd, args, { encoding: "utf8", ...opts });
 }
 
+/** curl with poll-with-retry: slow plugin activation after restart must not
+ *  false-alarm an unattended run. okCodes: accepted HTTP codes. Returns
+ *  { code, attempts }. */
+function curlPoll(url, okCodes, attempts = 5) {
+  let code = "";
+  let n = 0;
+  for (; n < attempts; n++) {
+    const r = sh("curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", url]);
+    code = (r.stdout || "").trim();
+    if (okCodes.includes(code)) break;
+    if (n < attempts - 1) sh("sleep", ["1"]);
+  }
+  return { code, attempts: n + 1 };
+}
 function restartAndSmokeTest(target) {
   // Syntax gate before any service touch.
   const check = sh(process.execPath, ["--check", target]);
@@ -186,8 +207,6 @@ function restartAndSmokeTest(target) {
     process.exitCode = 1;
     return;
   }
-  sh("sleep", ["3"]);
-
   const base = `http://localhost:${PORT}`;
   let pass = true;
 
@@ -206,19 +225,21 @@ function restartAndSmokeTest(target) {
   } catch { /* no plugins dir — skip */ }
 
   if (pluginId) {
-    const bundle = sh("curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", `${base}/plugins/${pluginId}/client/entry.mjs`]);
-    const ok = bundle.stdout === "200";
-    console.log(`  GET /plugins/${pluginId}/client/entry.mjs → ${bundle.stdout} (expect 200) ${ok ? "PASS" : "FAIL"}`);
+    const bundle = curlPoll(`${base}/plugins/${pluginId}/client/entry.mjs`, ["200"]);
+    const ok = bundle.code === "200";
+    console.log(`  GET /plugins/${pluginId}/client/entry.mjs → ${bundle.code} (expect 200, attempts: ${bundle.attempts}) ${ok ? "PASS" : "FAIL"}`);
     pass = pass && ok;
   } else {
     console.log("  (no installed plugins with client/entry.mjs — bundle smoke test skipped)");
   }
 
   // Traversal guard must still 404.
-  const trav = sh("curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", "--path-as-is",
-    pluginId ? `${base}/plugins/${pluginId}/client/../manifest.json` : `${base}/plugins/x/client/../manifest.json`]);
-  const travOk = trav.stdout === "404" || trav.stdout === "400";
-  console.log(`  GET traversal probe → ${trav.stdout} (expect 404) ${travOk ? "PASS" : "FAIL"}`);
+  const travUrl = pluginId
+    ? `${base}/plugins/${pluginId}/client/../manifest.json`
+    : `${base}/plugins/x/client/../manifest.json`;
+  const trav = curlPoll(travUrl, ["404", "400"]);
+  const travOk = trav.code === "404" || trav.code === "400";
+  console.log(`  GET traversal probe → ${trav.code} (expect 404, attempts: ${trav.attempts}) ${travOk ? "PASS" : "FAIL"}`);
   pass = pass && travOk;
 
   console.log(pass ? "\nSMOKE TEST: PASS" : "\nSMOKE TEST: FAIL");
@@ -273,6 +294,27 @@ function selfTest() {
 // ---------------------------------------------------------------------------
 
 const args = process.argv.slice(2);
+const KNOWN_FLAGS = new Set(["--self-test", "--target", "--check", "--no-restart"]);
+
+function printUsage() {
+  console.log("usage: node scripts/apply-send-hotfix.mjs [--check] [--no-restart] [--target <path/to/index.js>] [--self-test]");
+}
+
+// Unknown-flag audit FIRST: a typo'd flag (e.g. --chekc) must never silently
+// downgrade a read-only audit into a write + service restart.
+{
+  const unknown = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--target") { i += 1; continue; } // skip --target's value
+    if (a.startsWith("--") && !KNOWN_FLAGS.has(a)) unknown.push(a);
+  }
+  if (unknown.length > 0) {
+    console.error(`FAIL: unknown flag(s): ${unknown.join(", ")}`);
+    printUsage();
+    process.exit(1);
+  }
+}
 
 if (args.includes("--self-test")) {
   selfTest();
@@ -280,7 +322,18 @@ if (args.includes("--self-test")) {
 }
 
 const targetIdx = args.indexOf("--target");
-const target = resolve(targetIdx !== -1 ? args[targetIdx + 1] : detectTarget());
+let target;
+if (targetIdx !== -1) {
+  const targetArg = args[targetIdx + 1];
+  if (!targetArg || targetArg.startsWith("--")) {
+    console.error("FAIL: --target requires a path to the server index.js");
+    printUsage();
+    process.exit(1);
+  }
+  target = resolve(targetArg);
+} else {
+  target = resolve(detectTarget());
+}
 const checkOnly = args.includes("--check");
 const noRestart = args.includes("--no-restart");
 
@@ -315,8 +368,25 @@ if (missing.length > 0 && applied.length === 0 && already.length === 0) {
   process.exit(1);
 }
 
-writeFileSync(target, text);
-console.log(`\nWrote patched file (${applied.length} site group(s) applied).`);
+// Atomic + backed-up write: back up the original, write a temp file (same
+// mode bits, same directory), then rename over the target. If anything bails
+// mid-write, the original at `target` is never truncated.
+const st = statSync(target);
+copyFileSync(target, `${target}.pre-hotfix.bak`);
+const tmpTarget = `${target}.hotfix-tmp`;
+writeFileSync(tmpTarget, text, { mode: st.mode });
+renameSync(tmpTarget, target);
+console.log(`\nWrote patched file (${applied.length} site group(s) applied). Backup: ${target}.pre-hotfix.bak`);
+
+// Post-write sanity: guarded sites reference basename() at runtime — a future
+// upstream whose node:path import can't be patched would produce a file that
+// passes node --check but ReferenceErrors on first request. Never report PASS
+// on that: restore the backup and fail instead of restarting into it.
+if (applied.some((p) => p.name.startsWith("workspace")) && !text.includes(`basename(abs).startsWith(".")`)) {
+  console.error("FAIL: guarded sites applied but basename guard missing from output — restoring backup, not restarting.");
+  copyFileSync(`${target}.pre-hotfix.bak`, target);
+  process.exit(1);
+}
 
 if (missing.length > 0) {
   // Partial application on an upstream-changed file: surface loudly, still
