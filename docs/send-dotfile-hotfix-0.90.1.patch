@@ -1,0 +1,62 @@
+--- package/dist/server/index.js	1985-10-26 08:15:00.000000000 +0000
++++ patched-index.js	2026-09-18 21:17:52.686358087 +0000
+@@ -318,7 +318,10 @@
+         if (isDownload) {
+             // res.download sets Content-Disposition: attachment and RFC 5987
+             // filename* encoding for non-ASCII names.
+-            res.download(abs, name);
++            // HOTFIX (2026-09-18): res.download spawns its own send() without options —
++            // same send@1.x dotfile regression (workspace .pi/... files). Dotfile FILES
++            // were already refused above; dot-directories are legitimate workspace paths.
++            res.download(abs, name, { dotfiles: "allow" });
+         }
+         else {
+             if (isHtmlPreview) {
+@@ -335,7 +338,11 @@
+                 res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
+                 res.setHeader("X-Content-Type-Options", "nosniff");
+             }
+-            res.sendFile(abs);
++            // HOTFIX (2026-09-18): send@1.x default 'ignore' 404s any dot-segment path
++            // (e.g. workspace .pi/kanban.md). Replicate send@0.19 legacy semantics:
++            // dot-directories allowed, dotfile files still refused.
++            if (basename(abs).startsWith(".")) { res.status(404).end("not found"); return; }
++            res.sendFile(abs, { dotfiles: "allow" });
+         }
+     }
+     catch {
+@@ -399,7 +406,9 @@
+             const allowJs = req.query.allowJs === "1";
+             res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
+         }
+-        res.sendFile(abs);
++        // HOTFIX (2026-09-18): same send@1.x dotfile regression — see /api/file.
++        if (basename(abs).startsWith(".")) { res.status(404).end("not found"); return; }
++        res.sendFile(abs, { dotfiles: "allow" });
+     }
+     catch {
+         res.status(404).end("not found");
+@@ -498,7 +507,9 @@
+     }
+     res.setHeader("Content-Type", "text/css; charset=utf-8");
+     res.setHeader("Cache-Control", "no-cache");
+-    res.sendFile(file);
++    // HOTFIX (2026-09-18): user themes live under ~/.pi-web/themes (dot-dir) — same
++    // send@1.x regression. Theme ids come from the scanned theme list, not raw paths.
++    res.sendFile(file, { dotfiles: "allow" });
+ });
+ // Plugin client bundles: <dataDir>/plugins/<id>/client/* served at
+ // /plugins/<id>/client/* so the frontend can import() plugin views. Only the
+@@ -602,7 +613,11 @@
+         res.setHeader("Content-Type", "text/javascript; charset=utf-8");
+     }
+     res.setHeader("Cache-Control", "no-cache"); // 开发期改文件即生效
+-    res.sendFile(abs, (err) => {
++    // HOTFIX (2026-09-18): send@1.x removed the legacy dotfile fallback — default
++    // 'ignore' now 404s any path containing a dot-segment, and plugins live under
++    // ~/.pi-web/. Traversal is already guarded above (resolve within client/ root),
++    // so 'allow' only re-permits dotfiles inside the plugin's own client subtree.
++    res.sendFile(abs, { dotfiles: "allow" }, (err) => {
+         if (err && !res.headersSent)
+             res
+                 .status(err.statusCode === 404 ? 404 : 500)
